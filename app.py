@@ -176,8 +176,8 @@ async def get_question(candidate_id: str):
     except Exception as e:
         raise HTTPException(500, f"Failed to fetch question: {e}")
 
-@app.post("/submit_answer/{candidate_id}/{question_index}")
-async def submit_answer(candidate_id: str, question_index: int, file: UploadFile = File(...)):
+@app.post("/submit_answer/{candidate_id}/{currentQuestionIndex}")
+async def submit_answer(candidate_id: str, currentQuestionIndex: int, file: UploadFile = File(...)):
     tmp_input = tmp_wav_path = None
     try:
         # check session
@@ -208,12 +208,12 @@ async def submit_answer(candidate_id: str, question_index: int, file: UploadFile
             print("Whisper error:", e)
 
         # Upload audio to Supabase
-        audio_url = upload_to_supabase(tmp_input.name, candidate_id, prefix=f"answer_{question_index}")
+        audio_url = upload_to_supabase(tmp_input.name, candidate_id, prefix=f"answer_{currentQuestionIndex}")
 
 
         supabase.table("interviews").insert({
             "candidate_id": candidate_id,
-            "question": QUESTIONS[question_index],
+            "question": QUESTIONS[currentQuestionIndex],
             "answer_text": text_answer,
             "status": status,
             "answer_audio_url": audio_url
@@ -222,7 +222,7 @@ async def submit_answer(candidate_id: str, question_index: int, file: UploadFile
         # save in Mongo 
         interviews_collection.update_one(
             {"candidate_id": candidate_id},
-            {"$push": {"qa": [{"question": QUESTIONS[question_index], "answer": text_answer, "audio_url": audio_url}]}}
+            {"$push": {"qa": [{"question": QUESTIONS[currentQuestionIndex], "answer": text_answer, "audio_url": audio_url}]}}
         )
 
         # update session index
