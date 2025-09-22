@@ -122,6 +122,11 @@ def upload_to_supabase(file_path: str, candidate_id: str, prefix="bot_q") -> str
 
 # === Routes ===
 
+@app.get("/")
+async def home():
+    """Simple health check route"""
+    return {"message": "Backend is running 🚀"}
+
 @app.post("/start_interview")
 async def start_interview(req: StartRequest):
     try:
