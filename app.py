@@ -4,7 +4,6 @@ import tempfile
 import subprocess
 from pathlib import Path
 import wave
-from datetime import datetime
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,11 +64,15 @@ STATIC_DIR.mkdir(exist_ok=True)
 app = FastAPI(title="Interview Voice Bot Backend")
 
 # ------------------------------
-# CORS
+# CORS FIXED ✅
 # ------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5173",       # React dev server
+        "https://chat-17sb.onrender.com",  # Backend domain
+        # add your deployed React frontend domain here later
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -83,7 +86,7 @@ def get_whisper_model():
     global whisper_model
     if whisper_model is None:
         print("⏳ Loading Whisper model (tiny)...")
-        whisper_model = whisper.load_model("tiny", device="cpu")  # change device if you have GPU
+        whisper_model = whisper.load_model("tiny", device="cpu")  # lighter for Render
         print("✅ Whisper model ready")
     return whisper_model
 
@@ -100,8 +103,6 @@ QUESTIONS = [
 ]
 
 class StartRequest(BaseModel):
-    # You can pass candidate_id (re-use), or name/email to create/find by email
-    candidate_id: str | None = None
     name: str | None = None
     email: str | None = None
 
@@ -130,46 +131,25 @@ def root():
 
 @app.post("/api/start_interview")
 async def start_interview(req: StartRequest):
-    """
-    If `candidate_id` is provided in request body, we validate and reuse it.
-    Otherwise, fallback to lookup by email and create candidate if not present.
-    Returns candidate_id and next_question url.
-    """
-    candidate_id = None
-
-    # 1) If client provided candidate_id -> validate exists in Mongo (preferred flow)
-    if req.candidate_id:
-        candidate_id = req.candidate_id.strip()
-        candidate = candidates_collection.find_one({"candidate_id": candidate_id})
-        if not candidate:
-            raise HTTPException(status_code=404, detail="Candidate id provided but not found")
+    existing = supabase.table("candidates").select("*").eq("email", req.email).execute()
+    if existing.data:
+        candidate_id = existing.data[0]["candidate_id"]
     else:
-        # 2) Fallback: lookup by email in Supabase; if not found create new candidate
-        if not req.email:
-            raise HTTPException(status_code=400, detail="Either candidate_id or email is required")
+        candidate_id = str(uuid.uuid4())
+        supabase.table("candidates").insert({
+            "candidate_id": candidate_id,
+            "name": req.name,
+            "email": req.email
+        }).execute()
 
-        existing = supabase.table("candidates").select("*").eq("email", req.email).execute()
-        if existing.data:
-            candidate_id = existing.data[0]["candidate_id"]
-        else:
-            candidate_id = str(uuid.uuid4())
-            # Insert into Supabase
-            supabase.table("candidates").insert({
-                "candidate_id": candidate_id,
-                "name": req.name,
-                "email": req.email
-            }).execute()
+        candidates_collection.insert_one({
+            "_id": candidate_id,
+            "candidate_id": candidate_id,
+            "name": req.name,
+            "email": req.email
+        })
+        print(f"✅ Candidate saved in Mongo: {candidate_id}, {req.name}, {req.email}")
 
-            # Insert into Mongo
-            candidates_collection.insert_one({
-                "_id": candidate_id,
-                "candidate_id": candidate_id,
-                "name": req.name,
-                "email": req.email
-            })
-            print(f"✅ Candidate saved in Mongo: {candidate_id}, {req.name}, {req.email}")
-
-    # Create a session row for interview start (if one exists you may want to reset or upsert)
     supabase.table("sessions").insert({
         "candidate_id": candidate_id,
         "q_index": 0
@@ -184,13 +164,12 @@ async def start_interview(req: StartRequest):
 
 @app.get("/api/question/{candidate_id}")
 async def get_question(candidate_id: str):
-    # Ensure session exists
     session_res = supabase.table("sessions").select("*").eq("candidate_id", candidate_id).execute()
     if not session_res.data:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise HTTPException(404, "Session not found")
 
     session = session_res.data[0]
-    idx = session.get("q_index", 0)
+    idx = session["q_index"]
 
     if idx >= len(QUESTIONS):
         return {"done": True, "message": "Interview finished"}
@@ -216,18 +195,15 @@ async def get_question(candidate_id: str):
 
 @app.post("/api/submit_answer/{candidate_id}/{question_index}")
 async def submit_answer(candidate_id: str, question_index: int, file: UploadFile = File(...)):
-    # Validate session exists
     session_res = supabase.table("sessions").select("*").eq("candidate_id", candidate_id).execute()
     if not session_res.data:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise HTTPException(404, "Session not found")
     session = session_res.data[0]
 
-    # Save uploaded file temporarily
     tmp_input = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1])
     tmp_input.write(await file.read())
     tmp_input.close()
 
-    # Convert to wav for whisper
     tmp_wav_path = convert_to_wav(tmp_input.name)
 
     text_answer = ""
@@ -249,55 +225,39 @@ async def submit_answer(candidate_id: str, question_index: int, file: UploadFile
         print("❌ Whisper error:", e)
         text_answer = "(Transcription failed)"
 
-    # Upload original recorded file to Supabase storage
     path_in_bucket = f"{candidate_id}/{uuid.uuid4().hex}{os.path.splitext(file.filename)[1]}"
     with open(tmp_input.name, "rb") as f:
         supabase.storage.from_(BUCKET_NAME).upload(path_in_bucket, f.read())
     audio_url = supabase.storage.from_(BUCKET_NAME).get_public_url(path_in_bucket)
 
-    # Cleanup tmp files
-    try:
-        os.remove(tmp_input.name)
-    except Exception:
-        pass
-    try:
-        os.remove(tmp_wav_path)
-    except Exception:
-        pass
+    os.remove(tmp_input.name)
+    os.remove(tmp_wav_path)
 
-    # Save as structured object in Mongo
-    qa_obj = {
-        "question_index": question_index,
-        "question": QUESTIONS[question_index],
-        "answer": text_answer,
-        "audio_url": audio_url,
-        "ts": datetime.utcnow().isoformat()
-    }
-
+    qa_pair = [
+        f"Q: {QUESTIONS[question_index]}",
+        f"A: {text_answer}"
+    ]
     interviews_collection.update_one(
         {"candidate_id": candidate_id},
-        {"$push": {"qa": qa_obj}},
+        {"$push": {"qa": qa_pair}},
         upsert=True
     )
     print(f"✅ Answer saved in Mongo for candidate {candidate_id}, Q{question_index}")
 
-    # advance session index only if transcription ok (you can change logic if you want)
     if status == "ok":
         supabase.table("sessions").update(
-            {"q_index": session.get("q_index", 0) + 1}
+            {"q_index": session["q_index"] + 1}
         ).eq("candidate_id", candidate_id).execute()
 
     return {
         "answer_text": text_answer,
         "status": status,
         "saved_in_mongo": True,
-        "audio_url": audio_url,
         "next_question_url": f"/api/question/{candidate_id}"
     }
 
 @app.get("/api/finish_interview/{candidate_id}")
 async def finish_interview(candidate_id: str):
-    # remove session
     supabase.table("sessions").delete().eq("candidate_id", candidate_id.strip()).execute()
     doc = interviews_collection.find_one({"candidate_id": candidate_id.strip()}, {"_id": 0})
     return {"candidate_id": candidate_id.strip(), "answers": doc.get("qa", []) if doc else []}
@@ -311,12 +271,9 @@ async def get_answers(candidate_id: str):
 
     qa_list = doc.get("qa", [])
     transcript = []
-    # each qa item is now an object/dict {question, answer, ...}
-    for qa in qa_list:
-        q = qa.get("question", "")
-        a = qa.get("answer", "")
-        transcript.append(f"Q: {q}")
-        transcript.append(f"A: {a}")
+    for q, a in qa_list:
+        transcript.append(q)
+        transcript.append(a)
 
     return {
         "candidate_id": clean_id,
