@@ -48,14 +48,9 @@ STATIC_DIR.mkdir(exist_ok=True)
 app = FastAPI(title="Interview Voice Bot Backend")
 
 # === CORS ===
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",   # local frontend
-        FRONTEND_URL,              # env frontend (if set)
-        "https://your-frontend-domain.com"  # deployed frontend
-    ],
+    allow_origins=["*"],   # Open for testing. Replace with frontend domains later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
