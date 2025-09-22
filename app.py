@@ -51,7 +51,11 @@ app = FastAPI(title="Interview Voice Bot Backend")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:5173",   # local frontend
+        FRONTEND_URL,              # env frontend (if set)
+        "https://your-frontend-domain.com"  # deployed frontend
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -224,6 +228,8 @@ async def submit_answer(candidate_id: str, currentQuestionIndex: int, file: Uplo
             status = "ok"
         except Exception as e:
             logger.exception("Whisper transcription error")
+            text_answer = f"(Transcription failed: {str(e)})"
+            status = "error"
 
         # Upload audio
         audio_url = upload_to_supabase(tmp_input.name, candidate_id, prefix=f"answer_{currentQuestionIndex}")
