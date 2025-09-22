@@ -47,10 +47,13 @@ STATIC_DIR = Path("static")
 STATIC_DIR.mkdir(exist_ok=True)
 app = FastAPI(title="Interview Voice Bot Backend")
 
-# === CORS ===
+# === CORS (important for frontend) ===
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Open for testing. Replace with frontend domains later
+    allow_origins=[
+        "http://localhost:5173",
+        "https://your-frontend-domain.com",   # replace with your deployed frontend
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -116,6 +119,7 @@ def upload_to_supabase(file_path: str, candidate_id: str, prefix="bot_q") -> str
                 with open(file_path, "rb") as f2:
                     supabase.storage.from_(BUCKET_NAME).update(path_in_bucket, f2.read())
             else:
+                logger.error(f"Supabase upload failed: {e}")
                 raise
     return f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{path_in_bucket}"
 
