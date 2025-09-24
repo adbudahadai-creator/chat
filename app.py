@@ -5,9 +5,8 @@ import subprocess
 from pathlib import Path
 import wave
 import contextlib
-import logging
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -18,58 +17,47 @@ from pymongo import MongoClient
 import whisper
 import imageio_ffmpeg
 
-# === Logging ===
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("interview-backend")
 
-# === Load env ===
 load_dotenv()
-
-# === FFmpeg Path ===
+# FFmpeg Path
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-logger.info(f"Using FFmpeg from: {FFMPEG_PATH}")
+print(f"Using FFmpeg from: {FFMPEG_PATH}")
 
-# === Supabase ===
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 BUCKET_NAME = os.getenv("SUPABASE_BUCKET", "interview-audios")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# === MongoDB ===
 MONGO_URI = os.getenv("MONGO_URL") or os.getenv("MONGO_URI")
 mongo_client = MongoClient(MONGO_URI)
 mongo_db = mongo_client["recruiter-platform"]
 candidatereg_collection = mongo_db["candidateregisters"]
 interviews_collection = mongo_db["interviews"]
 
-# === App Setup ===
+# App
 STATIC_DIR = Path("static")
 STATIC_DIR.mkdir(exist_ok=True)
 app = FastAPI(title="Interview Voice Bot Backend")
 
-# === CORS (important for frontend) ===
+# cors
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "https://your-frontend-domain.com",   # replace with your deployed frontend
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# === Whisper ===
+# whisper
 whisper_model = None
 def get_whisper_model():
     global whisper_model
     if whisper_model is None:
-        logger.info("Loading Whisper model (base)...")
+        print("Loading Whisper model (base)...")
         whisper_model = whisper.load_model("base", device="cpu")
-        logger.info("Whisper model ready")
+        print("Whisper model ready")
     return whisper_model
 
-# === Interview Questions ===
 QUESTIONS = [
     "How many years of experience do you have?",
     "What is your current CTC?",
@@ -79,12 +67,16 @@ QUESTIONS = [
     "What is your notice period?",
 ]
 
+#  model
 class StartRequest(BaseModel):
     email: str
 
-# === Utils ===
+class UpdateAnswerRequest(BaseModel):
+    question_index: int
+    new_answer: str
+    status: str = "updated"
+
 def convert_to_wav(input_path: str) -> str:
-    """Convert audio file to WAV 16kHz mono PCM16"""
     try:
         with contextlib.closing(wave.open(input_path, "rb")) as wf:
             channels = wf.getnchannels()
@@ -94,7 +86,7 @@ def convert_to_wav(input_path: str) -> str:
             if channels == 1 and framerate == 16000 and sampwidth == 2 and comptype == "NONE":
                 return input_path
     except wave.Error:
-        pass
+        pass  
 
     fd, output_path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
@@ -119,16 +111,9 @@ def upload_to_supabase(file_path: str, candidate_id: str, prefix="bot_q") -> str
                 with open(file_path, "rb") as f2:
                     supabase.storage.from_(BUCKET_NAME).update(path_in_bucket, f2.read())
             else:
-                logger.error(f"Supabase upload failed: {e}")
                 raise
     return f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{path_in_bucket}"
 
-# === Routes ===
-
-@app.get("/")
-async def home():
-    """Simple health check route"""
-    return {"message": "Backend is running 🚀"}
 
 @app.post("/start_interview")
 async def start_interview(req: StartRequest):
@@ -140,7 +125,7 @@ async def start_interview(req: StartRequest):
 
         candidate_id = str(candidate_doc["_id"])
         name = candidate_doc.get("name")
-
+    
         # Supabase candidates
         existing = supabase.table("candidates").select("*").eq("candidate_id", candidate_id).execute()
         if not existing.data:
@@ -165,10 +150,11 @@ async def start_interview(req: StartRequest):
         return {
             "message": "Interview started",
             "candidate_id": candidate_id,
+            "name": name,
+            "email": email,
             "next_question_url": f"/question/{candidate_id}"
         }
     except Exception as e:
-        logger.exception("Failed to start interview")
         raise HTTPException(500, f"Failed to start interview: {e}")
 
 @app.get("/question/{candidate_id}")
@@ -194,26 +180,22 @@ async def get_question(candidate_id: str):
             "audio_url": audio_url
         }
     except Exception as e:
-        logger.exception("Failed to fetch question")
         raise HTTPException(500, f"Failed to fetch question: {e}")
 
-@app.post("/submit_answer/{candidate_id}/{currentQuestionIndex}")
-async def submit_answer(candidate_id: str, currentQuestionIndex: int, file: UploadFile = File(...)):
+@app.post("/submit_answer/{candidate_id}/{question_index}")
+async def submit_answer(candidate_id: str, question_index: int, file: UploadFile = File(...)):
     tmp_input = tmp_wav_path = None
     try:
-        # check session
         session_res = supabase.table("sessions").select("*").eq("candidate_id", candidate_id).execute()
         if not session_res.data:
             raise HTTPException(404, "Session not found")
         session = session_res.data[0]
 
-        # temp audio
         tmp_input = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1])
         tmp_input.write(await file.read())
         tmp_input.close()
         tmp_wav_path = convert_to_wav(tmp_input.name)
 
-        # transcription
         text_answer = "(Transcription failed)"
         status = "error"
         try:
@@ -226,36 +208,27 @@ async def submit_answer(candidate_id: str, currentQuestionIndex: int, file: Uplo
             text_answer = result.text.strip() or "(Could not detect speech)"
             status = "ok"
         except Exception as e:
-            logger.exception("Whisper transcription error")
-            text_answer = f"(Transcription failed: {str(e)})"
-            status = "error"
+            print("Whisper error:", e)
 
-        # Upload audio
-        audio_url = upload_to_supabase(tmp_input.name, candidate_id, prefix=f"answer_{currentQuestionIndex}")
+        audio_url = upload_to_supabase(tmp_input.name, candidate_id, prefix=f"answer_{question_index}")
 
-        # save in Supabase
         supabase.table("interviews").insert({
             "candidate_id": candidate_id,
-            "question": QUESTIONS[currentQuestionIndex],
+            "question": QUESTIONS[question_index],
             "answer_text": text_answer,
             "status": status,
             "answer_audio_url": audio_url
         }).execute()
 
-        # save in Mongo
         interviews_collection.update_one(
             {"candidate_id": candidate_id},
-            {"$push": {"qa": [{"question": QUESTIONS[currentQuestionIndex], "answer": text_answer, "audio_url": audio_url}]}}
+            {"$push": {"qa": [{"question": QUESTIONS[question_index], "answer": text_answer, "audio_url": audio_url}]}}
         )
 
-        # update session
         supabase.table("sessions").update({"q_index": session["q_index"] + 1}).eq("candidate_id", candidate_id).execute()
 
         return {"answer_text": text_answer, "status": status, "next_question_url": f"/question/{candidate_id}"}
 
-    except Exception as e:
-        logger.exception("Failed to submit answer")
-        raise HTTPException(500, f"Failed to submit answer: {e}")
     finally:
         if tmp_input and os.path.exists(tmp_input.name):
             os.remove(tmp_input.name)
@@ -265,14 +238,23 @@ async def submit_answer(candidate_id: str, currentQuestionIndex: int, file: Uplo
 @app.post("/finish_interview/{candidate_id}")
 async def finish_interview(candidate_id: str):
     try:
+        candidate_doc = candidatereg_collection.find_one({"_id": candidate_id})
+        name = candidate_doc.get("name") if candidate_doc else None
+        email = candidate_doc.get("email") if candidate_doc else None
+
         interviews_collection.update_one(
             {"candidate_id": candidate_id},
             {"$set": {"interview_finished": True}}
         )
         supabase.table("sessions").update({"status": "finished"}).eq("candidate_id", candidate_id).execute()
-        return {"message": "Interview finished", "candidate_id": candidate_id, "summary_url": f"/get_answers/{candidate_id}"}
+        return {
+            "message": "Interview finished",
+            "candidate_id": candidate_id,
+            "name": name,
+            "email": email,
+            "summary_url": f"/get_answers/{candidate_id}"
+        }
     except Exception as e:
-        logger.exception("Failed to finish interview")
         raise HTTPException(500, f"Failed to finish interview: {e}")
 
 @app.get("/get_answers/{candidate_id}")
@@ -280,14 +262,54 @@ async def get_answers(candidate_id: str):
     try:
         mongo_doc = interviews_collection.find_one({"candidate_id": candidate_id}, {"_id": 0})
         supa_res = supabase.table("interviews").select("*").eq("candidate_id", candidate_id).execute()
+        candidate_doc = candidatereg_collection.find_one({"_id": candidate_id})
+
         return {
             "candidate_id": candidate_id,
+            "name": candidate_doc.get("name") if candidate_doc else None,
+            "email": candidate_doc.get("email") if candidate_doc else None,
             "qa_mongo": mongo_doc.get("qa", []) if mongo_doc else [],
             "qa_supabase": supa_res.data
         }
     except Exception as e:
-        logger.exception("Failed to fetch answers")
         raise HTTPException(500, f"Failed to fetch answers: {e}")
 
-# === Static Files ===
+# 🔥 NEW CONTROLLER: Update an answer
+@app.put("/update_answer/{candidate_id}")
+async def update_answer(candidate_id: str, req: UpdateAnswerRequest = Body(...)):
+    try:
+        question = QUESTIONS[req.question_index]
+
+        # Mongo update
+        interviews_collection.update_one(
+            {"candidate_id": candidate_id, "qa.question": question},
+            {"$set": {
+                "qa.$.answer": req.new_answer,
+                "qa.$.status": req.status
+            }}
+        )
+
+        # Supabase update
+        supabase.table("interviews").update({
+            "answer_text": req.new_answer,
+            "status": req.status
+        }).eq("candidate_id", candidate_id).eq("question", question).execute()
+
+        candidate_doc = candidatereg_collection.find_one({"_id": candidate_id})
+        name = candidate_doc.get("name") if candidate_doc else None
+        email = candidate_doc.get("email") if candidate_doc else None
+
+        return {
+            "message": "Answer updated successfully",
+            "candidate_id": candidate_id,
+            "name": name,
+            "email": email,
+            "question": question,
+            "updated_answer": req.new_answer,
+            "status": req.status
+        }
+
+    except Exception as e:
+        raise HTTPException(500, f"Failed to update answer: {e}")
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
